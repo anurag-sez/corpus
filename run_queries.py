@@ -1,8 +1,7 @@
 """Run one Cypher query per question in queries.txt and write results.csv
 (Question, Cypher Query, Answer, Execution Time)."""
-import csv, json, os, time
-from neo4j import GraphDatabase
-from load_graph import load_env
+import csv, json, time
+from load_graph import connect
 
 QUERIES = [
 # 1 Consortium roles
@@ -99,18 +98,15 @@ def questions():
 
 
 if __name__ == "__main__":
-    load_env()
     qs = questions()
     assert len(qs) == len(QUERIES), (len(qs), len(QUERIES))
-    driver = GraphDatabase.driver(os.environ["NEO4J_URI"], auth=(os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]))
-    with driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as s, \
-            open("results.csv", "w", newline="", encoding="utf-8") as f:
+    driver, db = connect()
+    with driver.session(database=db) as s, open("results.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["Question", "Cypher Query", "Answer", "Execution Time (ms)"])
         for q, cy in zip(qs, QUERIES):
             t0 = time.perf_counter()
-            res = s.run(cy)
-            rows = [r.data() for r in res]
+            rows = [r.data() for r in s.run(cy)]
             ms = (time.perf_counter() - t0) * 1000
             w.writerow([q, cy, json.dumps(rows, ensure_ascii=False, default=str), f"{ms:.1f}"])
             print(f"{ms:7.1f} ms  {len(rows):2d} rows  {q[:50]}")

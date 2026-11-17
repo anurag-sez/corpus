@@ -7,11 +7,16 @@ import os
 from neo4j import GraphDatabase
 
 
-def load_env(path=".env"):
-    for line in open(path):
+def connect():
+    """Read .env and return (driver, database)."""
+    for line in open(".env"):
         if "=" in line and not line.startswith("#"):
             k, v = line.strip().split("=", 1)
             os.environ.setdefault(k, v)
+    driver = GraphDatabase.driver(os.environ["NEO4J_URI"],
+                                  auth=(os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]))
+    driver.verify_connectivity()
+    return driver, os.environ.get("NEO4J_DATABASE", "neo4j")
 
 
 ORGS = [  # name, type, city, country
@@ -138,92 +143,87 @@ SYMPOSIUM_PARTICIPANTS = [
 ]
 
 
+LABELS = {"Organization": "name", "Person": "name", "Project": "name", "Publication": "id",
+          "Site": "name", "Technology": "name", "Patent": "id", "Event": "name"}
+
+
+def dicts(keys, rows):
+    return [dict(zip(keys.split(), r)) for r in rows]
+
+
 def build(tx):
+    def run(cypher, rows):  # one batched UNWIND query per node/relationship type
+        tx.run("UNWIND $rows AS row " + cypher, rows=rows)
+
+    def link(a, b, rel, rows, props=""):
+        """MATCH (a:LabelA {key: row.a}), (b:LabelB {key: row.b}) CREATE (a)-[:rel {props}]->(b)"""
+        (la, ka), (lb, kb) = a.split(":"), b.split(":")
+        run(f"MATCH (a:{la} {{{ka}: row.a}}), (b:{lb} {{{kb}: row.b}}) CREATE (a)-[:{rel} {{{props}}}]->(b)", rows)
+
     tx.run("MATCH (n) DETACH DELETE n")
-    for n, t, city, country in ORGS:
-        tx.run("CREATE (:Organization {name:$n,type:$t,city:$city,country:$country})", n=n, t=t, city=city, country=country)
-    for n in PEOPLE:
-        tx.run("CREATE (:Person {name:$n})", n=n)
-    for n, s, e, pi in PROJECTS:
-        tx.run("""CREATE (pr:Project {name:$n,start:$s,end:$e}) WITH pr
-                  MATCH (p:Person {name:$pi}) CREATE (p)-[:PRINCIPAL_INVESTIGATOR_OF]->(pr)""", n=n, s=s, e=e, pi=pi)
-    for proj, f, amt, cur in FUNDING:
-        tx.run("""MATCH (p:Project {name:$p}),(o:Organization {name:$f})
-                  CREATE (p)-[:FUNDED_BY {amount:$a,currency:$c}]->(o)""", p=proj, f=f, a=amt, c=cur)
-    for proj, org, role in PARTICIPATION:
-        tx.run("""MATCH (p:Project {name:$p}),(o:Organization {name:$o})
-                  CREATE (o)-[:PARTICIPATES_IN {role:$r}]->(p)""", p=proj, o=org, r=role)
-    for person, org, kind, role, s, e, cur, seq in AFFIL:
-        tx.run("""MATCH (p:Person {name:$p}),(o:Organization {name:$o})
-                  CREATE (p)-[:AFFILIATED_WITH {kind:$k,role:$r,start:$s,end:$e,current:$c,seq:$q}]->(o)""",
-               p=person, o=org, k=kind, r=role, s=s, e=e, c=cur, q=seq)
-    for sup, stu, y in SUPERVISION:
-        tx.run("""MATCH (a:Person {name:$a}),(b:Person {name:$b})
-                  CREATE (a)-[:SUPERVISED {year:$y}]->(b)""", a=sup, b=stu, y=y)
-    for t in TECHS:
-        tx.run("CREATE (:Technology {name:$n})", n=t)
-    for proj, t in [("ALPINE", "Sodium-Ion Battery"), ("MONSOON", "Sodium-Ion Battery"),
-                    ("RECLAIM", "Sodium-Ion Battery"), ("MONSOON", "Thermal Management"),
-                    ("CASCADE", "Load Forecasting")]:
-        tx.run("MATCH (p:Project {name:$p}),(t:Technology {name:$t}) CREATE (p)-[:FOCUSES_ON]->(t)", p=proj, t=t)
 
-    for pid, title, y, venue, proj, authors, techs in PUBS:
-        tx.run("""MATCH (pr:Project {name:$proj})
-                  CREATE (pub:Publication {id:$id,title:$t,year:$y,venue:$v})-[:PRODUCED_IN]->(pr)""",
-               id=pid, t=title, y=y, v=venue, proj=proj)
-        for i, a in enumerate(authors, 1):
-            tx.run("""MATCH (p:Person {name:$a}),(pub:Publication {id:$id})
-                      CREATE (p)-[:AUTHORED {position:$i}]->(pub)""", a=a, id=pid, i=i)
-        for t in techs:
-            tx.run("MATCH (pub:Publication {id:$id}),(t:Technology {name:$t}) CREATE (pub)-[:ABOUT]->(t)", id=pid, t=t)
-    for a, b in CITES:
-        tx.run("MATCH (a:Publication {id:$a}),(b:Publication {id:$b}) CREATE (a)-[:CITES]->(b)", a=a, b=b)
+    # nodes
+    run("CREATE (:Organization {name:row.name, type:row.type, city:row.city, country:row.country})",
+        dicts("name type city country", ORGS))
+    run("CREATE (:Person {name:row})", PEOPLE)
+    run("CREATE (:Project {name:row.name, start:row.start, end:row.end})", dicts("name start end", [p[:3] for p in PROJECTS]))
+    run("CREATE (:Technology {name:row})", TECHS)
+    run("CREATE (:Publication {id:row.id, title:row.title, year:row.year, venue:row.venue})",
+        dicts("id title year venue", [p[:4] for p in PUBS]))
+    run("""CREATE (:Site {name:row.name, city:row.city, country:row.country,
+                          commissioned:row.year, capacity:row.capacity, battery:row.battery})""",
+        dicts("name city country year capacity battery", [x[:6] for x in SITES]))
+    tx.run("""CREATE (:Event {name:'Nordic Storage Symposium 2023', city:'Trondheim', country:'Norway',
+                              start:date('2023-06-14'), end:date('2023-06-16')})
+              CREATE (:Patent {id:'LSS-PAT-2020-114', filed:2020, granted:2022,
+                               title:'Layered Sodium-Ion Cell with Composite Electrolyte Interface'})""")
 
-    tx.run("""MATCH (h:Organization {name:'Halvorsen Institute of Technology'})
-              CREATE (e:Event {name:'Nordic Storage Symposium 2023',city:'Trondheim',country:'Norway',
-                               start:date('2023-06-14'),end:date('2023-06-16')})
-              CREATE (h)-[:HOSTED]->(e)""")
-    for pid in PRESENTED_AT_SYMPOSIUM:
-        tx.run("MATCH (p:Publication {id:$id}),(e:Event) CREATE (p)-[:PRESENTED_AT]->(e)", id=pid)
-    for person, role in SYMPOSIUM_PARTICIPANTS:
-        tx.run("MATCH (p:Person {name:$p}),(e:Event) CREATE (p)-[:PARTICIPATED_IN {role:$r}]->(e)", p=person, r=role)
+    # projects, funding, people
+    link("Person:name", "Project:name", "PRINCIPAL_INVESTIGATOR_OF", [{"a": p[3], "b": p[0]} for p in PROJECTS])
+    link("Project:name", "Organization:name", "FUNDED_BY", dicts("a b amount currency", FUNDING), "amount:row.amount, currency:row.currency")
+    link("Organization:name", "Project:name", "PARTICIPATES_IN",
+         [{"a": o, "b": p, "role": r} for p, o, r in PARTICIPATION], "role:row.role")
+    link("Person:name", "Organization:name", "AFFILIATED_WITH", dicts("a b kind role start end current seq", AFFIL),
+         "kind:row.kind, role:row.role, start:row.start, end:row.end, current:row.current, seq:row.seq")
+    link("Person:name", "Person:name", "SUPERVISED", dicts("a b year", SUPERVISION), "year:row.year")
+    link("Project:name", "Technology:name", "FOCUSES_ON",
+         dicts("a b", [("ALPINE", TECHS[0]), ("MONSOON", TECHS[0]), ("RECLAIM", TECHS[0]),
+                       ("MONSOON", TECHS[1]), ("CASCADE", TECHS[2])]))
 
-    tx.run("""CREATE (pt:Patent {id:'LSS-PAT-2020-114',title:'Layered Sodium-Ion Cell with Composite Electrolyte Interface',
-                                 filed:2020,granted:2022})
-              WITH pt
-              MATCH (l:Organization {name:'Lumen Storage Systems'}),(t:Technology {name:'Sodium-Ion Battery'}),
-                    (a:Project {name:'ALPINE'}),(v:Person {name:'Elena Voss'}),(k:Person {name:'Katarina Novak'})
-              CREATE (l)-[:HOLDS]->(pt), (pt)-[:COVERS]->(t), (pt)-[:LICENSED_IN]->(a),
-                     (v)-[:INVENTOR_OF]->(pt), (k)-[:INVENTOR_OF]->(pt)""")
-    tx.run("""MATCH (pub:Publication {id:'P23'}),(pt:Patent) CREATE (pt)-[:BACKGROUND_IN]->(pub)""")
+    # publications
+    link("Publication:id", "Project:name", "PRODUCED_IN", [{"a": p[0], "b": p[4]} for p in PUBS])
+    link("Person:name", "Publication:id", "AUTHORED",
+         [{"a": au, "b": p[0], "position": i} for p in PUBS for i, au in enumerate(p[5], 1)], "position:row.position")
+    link("Publication:id", "Technology:name", "ABOUT", [{"a": p[0], "b": t} for p in PUBS for t in p[6]])
+    link("Publication:id", "Publication:id", "CITES", dicts("a b", CITES))
 
-    for name, city, country, yr, cap, batt, ops, proj, supplier, mgr, techs in SITES:
-        tx.run("""MATCH (p:Project {name:$proj})
-                  CREATE (s:Site {name:$n,city:$city,country:$country,commissioned:$y,capacity:$cap,battery:$b})
-                  CREATE (s)-[:ESTABLISHED_UNDER]->(p)""",
-               n=name, city=city, country=country, y=yr, cap=cap, b=batt, proj=proj)
-        for o in ops:
-            tx.run("MATCH (s:Site {name:$s}),(o:Organization {name:$o}) CREATE (o)-[:OPERATES]->(s)", s=name, o=o)
-        if supplier:
-            tx.run("MATCH (s:Site {name:$s}),(o:Organization {name:$o}) CREATE (o)-[:SUPPLIED_CELLS_TO]->(s)", s=name, o=supplier)
-        if mgr:
-            tx.run("MATCH (s:Site {name:$s}),(p:Person {name:$p}) CREATE (p)-[:MANAGES]->(s)", s=name, p=mgr)
-        for t in techs:
-            tx.run("MATCH (s:Site {name:$s}),(t:Technology {name:$t}) CREATE (s)-[:USES_TECHNOLOGY]->(t)", s=name, t=t)
-    # patent-specific design links (corpus docs 28, 29, 32)
-    tx.run("""MATCH (pt:Patent),(s:Site) WHERE s.name IN ['Vestfjord Pilot Site','Tiruvallur Test Bed']
-              CREATE (s)-[:BUILT_TO_DESIGN]->(pt)""")
+    # event, patent
+    ev, pat = "Event:name", "Patent:id"
+    link("Organization:name", ev, "HOSTED", [{"a": "Halvorsen Institute of Technology", "b": "Nordic Storage Symposium 2023"}])
+    link("Publication:id", ev, "PRESENTED_AT", [{"a": p, "b": "Nordic Storage Symposium 2023"} for p in PRESENTED_AT_SYMPOSIUM])
+    link("Person:name", ev, "PARTICIPATED_IN",
+         [{"a": p, "b": "Nordic Storage Symposium 2023", "role": r} for p, r in SYMPOSIUM_PARTICIPANTS], "role:row.role")
+    pid = "LSS-PAT-2020-114"
+    link("Organization:name", pat, "HOLDS", [{"a": "Lumen Storage Systems", "b": pid}])
+    link(pat, "Technology:name", "COVERS", [{"a": pid, "b": TECHS[0]}])
+    link(pat, "Project:name", "LICENSED_IN", [{"a": pid, "b": "ALPINE"}])
+    link(pat, "Publication:id", "BACKGROUND_IN", [{"a": pid, "b": "P23"}])
+    link("Person:name", pat, "INVENTOR_OF", [{"a": p, "b": pid} for p in ("Elena Voss", "Katarina Novak")])
+
+    # sites
+    link("Site:name", "Project:name", "ESTABLISHED_UNDER", [{"a": x[0], "b": x[7]} for x in SITES])
+    link("Organization:name", "Site:name", "OPERATES", [{"a": o, "b": x[0]} for x in SITES for o in x[6]])
+    link("Organization:name", "Site:name", "SUPPLIED_CELLS_TO", [{"a": x[8], "b": x[0]} for x in SITES if x[8]])
+    link("Person:name", "Site:name", "MANAGES", [{"a": x[9], "b": x[0]} for x in SITES if x[9]])
+    link("Site:name", "Technology:name", "USES_TECHNOLOGY", [{"a": x[0], "b": t} for x in SITES for t in x[10]])
+    link("Site:name", pat, "BUILT_TO_DESIGN", [{"a": x[0], "b": pid} for x in SITES[:2]])  # docs 28, 29, 32
 
 
 if __name__ == "__main__":
-    load_env()
-    driver = GraphDatabase.driver(os.environ["NEO4J_URI"], auth=(os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]))
-    driver.verify_connectivity()
-    with driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as s:
-        for c, p in [("Organization", "name"), ("Person", "name"), ("Project", "name"),
-                     ("Publication", "id"), ("Site", "name"), ("Technology", "name"),
-                     ("Patent", "id"), ("Event", "name")]:
-            s.run(f"CREATE CONSTRAINT {c.lower()}_{p} IF NOT EXISTS FOR (n:{c}) REQUIRE n.{p} IS UNIQUE").consume()
+    driver, db = connect()
+    with driver.session(database=db) as s:
+        for label, key in LABELS.items():
+            s.run(f"CREATE CONSTRAINT {label.lower()}_{key} IF NOT EXISTS FOR (n:{label}) REQUIRE n.{key} IS UNIQUE").consume()
         s.execute_write(build)
         for r in s.run("MATCH (n) RETURN labels(n)[0] AS label, count(*) AS n ORDER BY label"):
             print(r["label"], r["n"])
