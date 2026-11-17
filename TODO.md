@@ -1,0 +1,1 @@
+Develop the project in VS Code, connect to your Neo4j Aura Free instance, and update the Knowledge Graph. Execute Cypher queries for all questions in queries.txt and submit a CSV containing Question, Cypher Query, Answer, and Execution Time. Ensure the CSV is committed to the repository and not added to .gitignore.
